@@ -11,14 +11,15 @@ Net::ISC::DHCPClient - ISC dhclient lease reader
 
 =head1 VERSION
 
-Version 0.01
+Version 0.02
 
 =cut
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 
-use Net::ISC::DHCPClient::Lease;
+use Net::ISC::DHCPClient::InetLease;
+use Net::ISC::DHCPClient::Inet6Lease;
 use Time::Local;
 
 
@@ -28,21 +29,26 @@ sub new {
     die "Missing leases_path!" if (!defined($opts{leases_path}));
 
     my $self = {};
+
+    # Incoming arguments:
     $self->{INTERFACE} = defined($opts{interface}) ? $opts{interface} : undef;
     $self->{leases_path} = $opts{leases_path};
-    $self->{leases} = undef;
-    bless ($self, $class);
 
-    $self->leases();
-    $self->{leases} = $self->_read_lease_file($self->{leases_path}, $self->{INTERFACE});
+    # Internal storage:
+    $self->{leases_af_inet} = undef;
+    $self->{leases_af_inet6} = undef;
+
+    bless ($self, $class);
 
     return $self;
 }
 
 
-sub is_dhcp($;$)
+sub is_dhcp($$;$)
 {
-    my ($self, $inteface_to_query) = @_;
+    my ($self, $af, $inteface_to_query) = @_;
+
+    die "Address family is: inet or inet6!" if (!($af eq 'inet' || $af eq 'inet6'));
 
     if (defined($inteface_to_query) &&
         defined($self->{INTERFACE}) &&
@@ -50,42 +56,85 @@ sub is_dhcp($;$)
         die "Cannot query $inteface_to_query.";
     }
     if (defined($self->{INTERFACE})) {
-        return scalar(@{$self->{leases}}) > 0;
+        if ($af eq 'inet') {
+            $self->leases_af_inet();
+            return scalar(@{$self->{leases_af_inet}}) > 0;
+        }
+        if ($af eq 'inet6') {
+            $self->leases_af_inet6();
+            return scalar(@{$self->{leases_af_inet6}}) > 0;
+        }
+
+        return 0;
     }
 
     die "Need interface!" if (!defined($inteface_to_query));
 
     # Iterate all found leases and look for given interface
-    for my $lease (@{$self->leases}) {
+    my $leases_to_check;
+    $leases_to_check = $self->{leases_af_inet} if ($af eq 'inet');
+    $leases_to_check = $self->{leases_af_inet6} if ($af eq 'inet6');
+    for my $lease (@$leases_to_check) {
         return 1 if ($lease->{INTERFACE} eq $inteface_to_query);
     }
 
     return 0;
 }
 
-sub leases($)
+sub leases_af_inet($)
 {
     my ($self) = @_;
 
-    return $self->{leases};
+    return $self->{leases_af_inet} if ($self->{leases_af_inet});
+
+    $self->{leases_af_inet} = $self->_read_lease_file($self->{leases_path},
+                                                $self->{INTERFACE},
+                                                'inet');
+
+    return $self->{leases_af_inet};
+}
+
+sub leases_af_inet6($)
+{
+    my ($self) = @_;
+
+    return $self->{leases_af_inet6} if ($self->{leases_af_inet6});
+
+    $self->{leases_af_inet6} = $self->_read_lease_file($self->{leases_path},
+                                                $self->{INTERFACE},
+                                                'inet6');
+
+    return $self->{leases_af_inet6};
 }
 
 
-sub _read_lease_file($$;$)
+sub _read_lease_file($$$$)
 {
-    my ($self, $path, $interface) = @_;
+    my ($self, $path, $interface, $af) = @_;
     my @lease_files;
     my $leases = [];
 
     # Search for matching .lease files
     my $leasefile_re1;
     my $leasefile_re2;
-    if ($interface) {
-        $leasefile_re1 = qr/^dhclient-(.*)?-($interface)\.lease$/;
-        $leasefile_re2 = qr/^dhclient\.($interface)\.leases$/;
+    if ($af eq 'inet') {
+        if ($interface) {
+            $leasefile_re1 = qr/^dhclient-(.*)?-($interface)\.lease$/;
+            $leasefile_re2 = qr/^dhclient\.($interface)\.leases$/;
+        } else {
+            $leasefile_re1 = qr/^dhclient-(.*)?-(.+)\.lease$/;
+            $leasefile_re2 = qr/^dhclient\.(.+)\.leases$/;
+        }
+    } elsif ($af eq 'inet6') {
+        if ($interface) {
+            $leasefile_re1 = qr/^dhclient6-(.*)?-($interface)\.lease$/;
+            $leasefile_re2 = qr/^dhclient6\.($interface)\.leases$/;
+        } else {
+            $leasefile_re1 = qr/^dhclient6-(.*)?-(.+)\.lease$/;
+            $leasefile_re2 = qr/^dhclient6\.(.+)\.leases$/;
+        }
     } else {
-        $leasefile_re1 = qr/^dhclient-(.*)?-(.+)\.lease$/;
-        $leasefile_re2 = qr/^dhclient\.(.+)\.leases$/;
+        die "Unknown AF! '$af'";
     }
 
     my @paths_to_attempt;
@@ -115,11 +164,17 @@ sub _read_lease_file($$;$)
 
         my $currentLease;
         my $hasLease = 0;
+        my $ia_type = [];
         while (<LEASEFILE>) {
             chomp();
-            if (/^lease \{/) {
+            if (/^lease? \{/) {
                 $hasLease = 1;
-                $currentLease = Net::ISC::DHCPClient::Lease->new();
+                $currentLease = Net::ISC::DHCPClient::InetLease->new();
+                next;
+            }
+            if (/^lease6 \{/) {
+                $hasLease = 1;
+                $currentLease = Net::ISC::DHCPClient::Inet6Lease->new();
                 next;
             }
             if (/^\}/) {
@@ -136,41 +191,8 @@ sub _read_lease_file($$;$)
 
             s/^\s+//;   # Eat starting whitespace
 
-            SWITCH: {
-                # interface "eth1";
-                /^interface\s+"(.+)";/ && do {
-                    $currentLease->{INTERFACE} = $1;
-                    last SWITCH;
-                };
-                # fixed-address 213.28.228.27;
-                /^fixed-address\s+(.+);/ && do {
-                    $currentLease->{FIXED_ADDRESS} = $1;
-                    last SWITCH;
-                };
-                # option subnet-mask 255.255.255.0;
-                (/^option\s+(\S+)\s*(.+);/) && do {
-                    $currentLease->{OPTION}{$1} = $2;
-                    last SWITCH;
-                };
-                # renew 5 2002/12/27 06:25:31;
-                (m#^renew\s+(\d+)\s+(\d+)/(\d+)/(\d+)\s+(\d+):(\d+):(\d+);#) && do {
-                    my $leaseTime = timegm($7, $6, $5, $4, $3-1, $2);
-                    $currentLease->{RENEW} = $leaseTime;
-                    last SWITCH;
-                };
-                # rebind 5 2002/12/27 06:25:31;
-                (m#^rebind\s+(\d+)\s+(\d+)/(\d+)/(\d+)\s+(\d+):(\d+):(\d+);#) && do {
-                    my $leaseTime = timegm($7, $6, $5, $4, $3-1, $2);
-                    $currentLease->{REBIND} = $leaseTime;
-                    last SWITCH;
-                };
-                # renew 5 2002/12/27 06:25:31;
-                (m#^expire\s+(\d+)\s+(\d+)/(\d+)/(\d+)\s+(\d+):(\d+):(\d+);#) && do {
-                    my $leaseTime = timegm($7, $6, $5, $4, $3-1, $2);
-                    $currentLease->{EXPIRE} = $leaseTime;
-                    last SWITCH;
-                };
-            }
+            $self->_af_inet_lease_parser($currentLease) if ($af eq 'inet');
+            $self->_af_inet6_lease_parser($currentLease, $ia_type) if ($af eq 'inet6');
         }
     }
 
@@ -178,6 +200,130 @@ sub _read_lease_file($$;$)
 
     return $leases;
 }
+
+sub _af_inet_lease_parser($$)
+{
+    my ($self, $currentLease) = @_;
+
+    SWITCH: {
+        # interface "eth1";
+        /^interface\s+"(.+)";/ && do {
+            $currentLease->{INTERFACE} = $1;
+            last SWITCH;
+        };
+        # fixed-address 213.28.228.27;
+        /^fixed-address\s+(.+);/ && do {
+            $currentLease->{FIXED_ADDRESS} = $1;
+            last SWITCH;
+        };
+        # option subnet-mask 255.255.255.0;
+        (/^option\s+(\S+)\s*(.+);/) && do {
+            $currentLease->{OPTION}{$1} = $2;
+            last SWITCH;
+        };
+        # renew 5 2002/12/27 06:25:31;
+        (m#^renew\s+(\d+)\s+(\d+)/(\d+)/(\d+)\s+(\d+):(\d+):(\d+);#) && do {
+            my $leaseTime = timegm($7, $6, $5, $4, $3-1, $2);
+            $currentLease->{RENEW} = $leaseTime;
+            last SWITCH;
+        };
+        # rebind 5 2002/12/27 06:25:31;
+        (m#^rebind\s+(\d+)\s+(\d+)/(\d+)/(\d+)\s+(\d+):(\d+):(\d+);#) && do {
+            my $leaseTime = timegm($7, $6, $5, $4, $3-1, $2);
+            $currentLease->{REBIND} = $leaseTime;
+            last SWITCH;
+        };
+        # renew 5 2002/12/27 06:25:31;
+        (m#^expire\s+(\d+)\s+(\d+)/(\d+)/(\d+)\s+(\d+):(\d+):(\d+);#) && do {
+            my $leaseTime = timegm($7, $6, $5, $4, $3-1, $2);
+            $currentLease->{EXPIRE} = $leaseTime;
+            last SWITCH;
+        };
+    }
+}
+
+sub _af_inet6_lease_parser($$$)
+{
+    my ($self, $currentLease, $ia_type) = @_;
+
+    my $context = '';
+    my $addr = '';
+    $context = $ia_type->[0] if (defined($ia_type->[0]));
+    $addr = $ia_type->[1] if (defined($ia_type->[1]));
+
+    SWITCH: {
+        # interface "eth1";
+        /^interface\s+"(.+)";/ && do {
+            $currentLease->{INTERFACE} = $1;
+            last SWITCH;
+        };
+        /^ia-na\s+(\S+)\s*\{/ && do {
+            # Identity Association: Non-temporary Address
+            push(@$ia_type, 'non-temporary');
+            $currentLease->{IA}->{'non-temporary'} = {};
+            last SWITCH;
+        };
+        /^ia-pd\s+(\S+)\s*\{/ && do {
+            # Identity Association: Prefix Delegation
+            push(@$ia_type, 'prefix');
+            $currentLease->{IA}->{'prefix'} = {};
+            last SWITCH;
+        };
+        /^\}/ && do {
+            pop(@$ia_type);
+            last SWITCH;
+        };
+        # starts 1517742816;
+        # Note: either IA or address
+        /^(starts)\s+(\d+);/ && do {
+            if (defined($ia_type->[1])) {
+                $currentLease->{IA}->{$context}->{$addr}->{$1} = $2;
+            } else {
+                $currentLease->{IA}->{$context}->{$1} = $2;
+            }
+            last SWITCH;
+        };
+        # renew 302400;
+        /^(renew)\s+(\d+);/ && do {
+            $currentLease->{IA}->{$context}->{$1} = $2;
+            last SWITCH;
+        };
+        # rebind 483840;
+        /^(rebind)\s+(\d+);/ && do {
+            $currentLease->{IA}->{$context}->{$1} = $2;
+            last SWITCH;
+        };
+        # preferred-life 604800;
+        /^(preferred-life)\s+(\d+);/ && do {
+            $currentLease->{IA}->{$context}->{$addr}->{$1} = $2;
+            last SWITCH;
+        };
+        # max-life 2592000;
+        /^(max-life)\s+(\d+);/ && do {
+            $currentLease->{IA}->{$context}->{$addr}->{$1} = $2;
+            last SWITCH;
+        };
+        /^(iaaddr)\s+(\S+)\s*\{/ && do {
+            # Identity Association Address
+            push(@$ia_type, $1);
+            $currentLease->{IA}->{$context}->{$1}->{addr} = $2;
+            last SWITCH;
+        };
+        /^(iaprefix)\s+(\S+)\s*\{/ && do {
+            # Identity Association Prefix
+            push(@$ia_type, $1);
+            $currentLease->{IA}->{$context}->{$1}->{addr} = $2;
+            last SWITCH;
+        };
+        /^option\s+dhcp6\.(\S+)\s+(.+)$/ && do {
+            # option dhcp6.<option> <value>
+            # Collect only global options, skip the IA options
+            $currentLease->{OPTION}->{$1} = $2 if (!$context);
+            last SWITCH;
+        };
+    }
+}
+
 
 =head1 AUTHOR
 
@@ -267,6 +413,7 @@ EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 =cut
+
 
 # vim: tabstop=4 shiftwidth=4 softtabstop=4 expandtab:
 
