@@ -1,6 +1,6 @@
 package Net::ISC::DHCPClient;
 
-use 5.006;
+use 5.014;
 use strict;
 use warnings;
 
@@ -11,11 +11,11 @@ Net::ISC::DHCPClient - ISC dhclient lease reader
 
 =head1 VERSION
 
-Version 0.10
+Version 0.12
 
 =cut
 
-our $VERSION = '0.10';
+our $VERSION = '0.12';
 
 
 use Net::ISC::DHCPClient::InetLease;
